@@ -1,6 +1,5 @@
-# Daltons Tile Search
+PalletSearch
 
-A client-side React web app for searching uploaded truck pallet data in memory.
 
 ## Local development
 
