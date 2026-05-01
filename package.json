@@ -1,0 +1,14 @@
+{
+  "name": "daltons-tile-search",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Client-side React app for Dalton's Tile Search",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.0.10"
+  }
+}
