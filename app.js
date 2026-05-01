@@ -106,6 +106,7 @@
     source_page: ["source_page", "source page", "page", "page_number", "page number"],
     order_number: ["order_number", "order number", "order"],
     order_type: ["order_type", "order type", "type"],
+    customer_name: ["customer_name", "customer name", "customer", "account", "customer_name_text"],
     item_number: ["item_number", "item number", "item", "sku", "product code"],
     product_description: ["product_description", "product description", "description", "product"],
     quantity: ["quantity", "qty"],
@@ -595,6 +596,12 @@
     return uom ? `${formattedQuantity} ${uom}` : formattedQuantity;
   }
 
+  function formatPrimaryQuantityWithUom(quantity, uom) {
+    const rawQuantity = safeText(quantity);
+    const formattedQuantity = rawQuantity && isNumericText(rawQuantity) ? rawQuantity : formatNumber(quantity);
+    return uom ? `${formattedQuantity} ${uom}` : formattedQuantity;
+  }
+
   function mapQuantityToBuckets(quantity, uom) {
     const normalizedUom = normalizeUom(uom);
     const quantityValue = String(quantity || "").trim();
@@ -622,19 +629,40 @@
     return quantityBuckets;
   }
 
-  function readQuantityBuckets(input, options) {
+  function readQuantityFields(input, options) {
     const config = options || {};
     const preferNumbers = Boolean(config.preferNumbers);
+    const rawQtyValue = input.qtyValue ?? input.qty_value ?? input.quantity ?? "";
+    const rawQtyUom = input.qtyUom ?? input.qty_uom ?? deriveUomValue(input.uom, input.cartons);
     const explicitBuckets = {
       cartonsQty: input.cartonsQty ?? input.cartons_qty ?? "",
       piecesQty: input.piecesQty ?? input.pieces_qty ?? "",
       squareFeetQty: input.squareFeetQty ?? input.square_feet_qty ?? input.squareFootQty ?? "",
       otherQty: input.otherQty ?? input.other_qty ?? ""
     };
+
+    return {
+      qtyValue: preferNumbers ? parseCount(rawQtyValue) : safeText(rawQtyValue),
+      qtyUom: normalizeUom(rawQtyUom),
+      cartonsQty: preferNumbers ? parseCount(explicitBuckets.cartonsQty) : safeText(explicitBuckets.cartonsQty),
+      piecesQty: preferNumbers ? parseCount(explicitBuckets.piecesQty) : safeText(explicitBuckets.piecesQty),
+      squareFeetQty: preferNumbers ? parseCount(explicitBuckets.squareFeetQty) : safeText(explicitBuckets.squareFeetQty),
+      otherQty: preferNumbers ? parseCount(explicitBuckets.otherQty) : safeText(explicitBuckets.otherQty)
+    };
+  }
+
+  function readQuantityBuckets(input, options) {
+    const config = options || {};
+    const preferNumbers = Boolean(config.preferNumbers);
+    const quantityFields = readQuantityFields(input, options);
+    const explicitBuckets = {
+      cartonsQty: quantityFields.cartonsQty,
+      piecesQty: quantityFields.piecesQty,
+      squareFeetQty: quantityFields.squareFeetQty,
+      otherQty: quantityFields.otherQty
+    };
     const hasExplicitBuckets = Object.values(explicitBuckets).some((value) => normalizeText(value));
-    const fallbackBuckets = hasExplicitBuckets
-      ? explicitBuckets
-      : mapQuantityToBuckets(input.quantity, deriveUomValue(input.uom, input.cartons));
+    const fallbackBuckets = hasExplicitBuckets ? explicitBuckets : mapQuantityToBuckets(quantityFields.qtyValue, quantityFields.qtyUom);
 
     return Object.fromEntries(
       Object.entries(fallbackBuckets).map(([fieldName, value]) => [
@@ -645,10 +673,18 @@
   }
 
   function getPrimaryQuantityPair(quantityBuckets) {
+    const normalizedPrimaryUom = normalizeUom(quantityBuckets.qtyUom);
+    if (isPopulatedQuantity(quantityBuckets.qtyValue)) {
+      return {
+        quantity: quantityBuckets.qtyValue,
+        uom: normalizedPrimaryUom || ""
+      };
+    }
+
     const orderedPairs = [
+      { quantity: quantityBuckets.squareFeetQty, uom: "SF" },
       { quantity: quantityBuckets.cartonsQty, uom: "CT" },
       { quantity: quantityBuckets.piecesQty, uom: "PC" },
-      { quantity: quantityBuckets.squareFeetQty, uom: "SF" },
       { quantity: quantityBuckets.otherQty, uom: "OTHER" }
     ];
 
@@ -659,27 +695,51 @@
   }
 
   function getQuantityDisplayParts(quantityBuckets) {
-    const orderedPairs = [
+    const displayParts = [];
+    const primaryQuantityPair = getPrimaryQuantityPair(quantityBuckets);
+
+    if (isPopulatedQuantity(primaryQuantityPair.quantity)) {
+      displayParts.push(formatPrimaryQuantityWithUom(primaryQuantityPair.quantity, primaryQuantityPair.uom));
+    }
+
+    [
       { quantity: quantityBuckets.cartonsQty, uom: "CT" },
       { quantity: quantityBuckets.piecesQty, uom: "PC" },
       { quantity: quantityBuckets.squareFeetQty, uom: "SF" },
       { quantity: quantityBuckets.otherQty, uom: "OTHER" }
-    ];
-
-    return orderedPairs
+    ]
       .filter((entry) => isPopulatedQuantity(entry.quantity))
-      .map((entry) => formatQuantityWithUom(entry.quantity, entry.uom));
+      .forEach((entry) => {
+        if (
+          isPopulatedQuantity(primaryQuantityPair.quantity) &&
+          normalizeUom(primaryQuantityPair.uom) === entry.uom &&
+          safeText(primaryQuantityPair.quantity) === safeText(entry.quantity)
+        ) {
+          return;
+        }
+
+        displayParts.push(formatQuantityWithUom(entry.quantity, entry.uom));
+      });
+
+    return displayParts;
   }
 
   function buildDisplayQty(quantityBuckets) {
     const displayParts = getQuantityDisplayParts(quantityBuckets);
-    return displayParts.length > 0 ? displayParts.join(" + ") : "";
+    return displayParts.length > 0 ? displayParts.join(" · ") : "";
   }
 
   function buildQuantityTotals(rows) {
     const totals = new Map();
 
     rows.forEach((row) => {
+      const mainQtyValue = row.qtyValue ?? row.quantity;
+      const mainQtyUom = normalizeUom(row.qtyUom || row.uom);
+
+      if (isPopulatedQuantity(mainQtyValue) && mainQtyUom) {
+        totals.set(mainQtyUom, (totals.get(mainQtyUom) || 0) + parseCount(mainQtyValue));
+      }
+
       [
         ["CT", row.cartonsQty],
         ["PC", row.piecesQty],
@@ -688,6 +748,10 @@
       ].forEach(([uom, value]) => {
         const numericValue = parseCount(value);
         if (!isPopulatedQuantity(value)) {
+          return;
+        }
+
+        if (mainQtyUom === uom && safeText(mainQtyValue) === safeText(value)) {
           return;
         }
 
@@ -702,7 +766,7 @@
   }
 
   function formatQuantityTotals(totals) {
-    const orderedUoms = ["CT", "PC", "SF", "OTHER"];
+    const orderedUoms = ["SF", "CT", "PC", "EA", "OTHER"];
     return (totals || [])
       .slice()
       .sort((left, right) => orderedUoms.indexOf(left.uom) - orderedUoms.indexOf(right.uom))
@@ -718,13 +782,23 @@
     const orderTypeDetails = getOrderTypeDetails(input.orderType || input.rawOrderType || "");
     const rawOrderType = orderTypeDetails.orderType;
     const rawProduct = safeText(getDescription(input)) || "Needs review";
+    const rawCustomerName = safeText(input.customerName || input.customer_name);
     const rawItemNumber = safeText(input.itemNumber);
     const sourcePage = Number(input.sourcePage || input.source_page || input.pageNumber || 0);
     const parsedOrder = parseOrder(rawOrderNumber, rawOrderType);
     const palletNumber = extractPalletNumber(rawPallet || (sourcePage ? buildPagePalletNumber(sourcePage) : "UNASSIGNED"));
-    const quantityBuckets = readQuantityBuckets(input, { preferNumbers: true });
-    const primaryQuantityPair = getPrimaryQuantityPair(quantityBuckets);
-    const displayQty = buildDisplayQty(quantityBuckets);
+    const quantityFields = readQuantityFields(input);
+    const quantityBuckets = readQuantityBuckets(input);
+    const primaryQuantityPair = getPrimaryQuantityPair({
+      ...quantityBuckets,
+      qtyValue: quantityFields.qtyValue,
+      qtyUom: quantityFields.qtyUom
+    });
+    const displayQty = buildDisplayQty({
+      ...quantityBuckets,
+      qtyValue: quantityFields.qtyValue,
+      qtyUom: quantityFields.qtyUom
+    });
 
     return {
       id: `${rawShipDate}-${palletNumber}-${parsedOrder.display}-${rawItemNumber}-${rowIndex}`,
@@ -738,12 +812,15 @@
       rawOrderType: orderTypeDetails.rawOrderType,
       orderTypeConfidence: safeText(input.orderTypeConfidence || orderTypeDetails.confidence || "high"),
       orderDisplay: parsedOrder.display,
+      customerName: rawCustomerName,
       itemNumber: rawItemNumber,
       productDescription: rawProduct,
       rawBlock: safeText(input.rawBlock || input.raw_block),
       error: safeText(input.error),
-      quantity: parseCount(primaryQuantityPair.quantity),
-      uom: primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom,
+      qtyValue: safeText(quantityFields.qtyValue || primaryQuantityPair.quantity),
+      qtyUom: quantityFields.qtyUom || (primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom),
+      quantity: safeText(quantityFields.qtyValue || primaryQuantityPair.quantity),
+      uom: quantityFields.qtyUom || (primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom),
       cartonsQty: quantityBuckets.cartonsQty,
       piecesQty: quantityBuckets.piecesQty,
       squareFeetQty: quantityBuckets.squareFeetQty,
@@ -751,19 +828,34 @@
       displayQty,
       searchIndex: {
         product: normalizeText(rawProduct),
+        customer: normalizeText(rawCustomerName),
         orderText: normalizeText(`${rawOrderNumber} ${parsedOrder.display} ${parsedOrder.type}`),
         orderDigits: digitsOnly(`${rawOrderNumber}${parsedOrder.number}`),
         palletText: normalizeText(`${rawPallet} ${rawPalletLp} ${palletNumber} ${formatPalletLabel(palletNumber)} page ${sourcePage}`),
-        quantityText: normalizeText(displayQty)
+        quantityText: normalizeText(displayQty),
+        allText: normalizeText(
+          `${rawCustomerName} ${rawProduct} ${rawOrderNumber} ${parsedOrder.display} ${parsedOrder.type} ${rawPallet} ${rawPalletLp} ${palletNumber} ${formatPalletLabel(
+            palletNumber
+          )}`
+        )
       }
     };
   }
 
   function createPreviewRow(input, rowIndex) {
     const rawOcrConfidence = Number(input.ocrConfidence);
+    const quantityFields = readQuantityFields(input);
     const quantityBuckets = readQuantityBuckets(input);
-    const primaryQuantityPair = getPrimaryQuantityPair(quantityBuckets);
-    const displayQty = buildDisplayQty(quantityBuckets);
+    const primaryQuantityPair = getPrimaryQuantityPair({
+      ...quantityBuckets,
+      qtyValue: quantityFields.qtyValue,
+      qtyUom: quantityFields.qtyUom
+    });
+    const displayQty = buildDisplayQty({
+      ...quantityBuckets,
+      qtyValue: quantityFields.qtyValue,
+      qtyUom: quantityFields.qtyUom
+    });
     const sourcePage = Number(input.sourcePage || input.source_page || input.pageNumber || 0);
     const normalizedPalletNumber = safeText(input.palletNumber || input.palletId) || (sourcePage ? buildPagePalletNumber(sourcePage) : "");
     const orderTypeDetails = getOrderTypeDetails(input.orderType || input.rawOrderType || "");
@@ -780,11 +872,14 @@
       orderType: orderTypeDetails.orderType,
       rawOrderType: safeText(input.rawOrderType || orderTypeDetails.rawOrderType),
       orderTypeConfidence: safeLower(input.orderTypeConfidence || orderTypeDetails.confidence || "high") === "high" ? "high" : "low",
+      customerName: safeText(input.customerName || input.customer_name),
       itemNumber: safeText(input.itemNumber),
       productDescription: safeText(getDescription(input)) || "Needs review",
-      quantity: safeText(primaryQuantityPair.quantity || input.quantity || "0"),
+      qtyValue: safeText(quantityFields.qtyValue || primaryQuantityPair.quantity || input.quantity || "0"),
+      qtyUom: safeText(quantityFields.qtyUom || (primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom)),
+      quantity: safeText(quantityFields.qtyValue || primaryQuantityPair.quantity || input.quantity || "0"),
       error: safeText(input.error),
-      uom: primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom,
+      uom: safeText(quantityFields.qtyUom || (primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom)),
       cartonsQty: safeText(quantityBuckets.cartonsQty || "0"),
       piecesQty: safeText(quantityBuckets.piecesQty || "0"),
       squareFeetQty: safeText(quantityBuckets.squareFeetQty || "0"),
@@ -801,6 +896,7 @@
 
   function getPreviewRowReviewIssues(row) {
     const reviewIssues = [];
+    const quantityFields = readQuantityFields(row);
     const quantityBuckets = readQuantityBuckets(row);
 
     if (!safeText(row.palletNumber)) {
@@ -823,7 +919,7 @@
       reviewIssues.push("description needs review");
     }
 
-    if (!Object.values(quantityBuckets).some((value) => isPopulatedQuantity(value))) {
+    if (!isPopulatedQuantity(quantityFields.qtyValue) && !Object.values(quantityBuckets).some((value) => isPopulatedQuantity(value))) {
       reviewIssues.push("missing qty");
     }
 
@@ -866,9 +962,12 @@
         palletLp: "",
         orderNumber: "",
         orderType: "",
+        customerName: "",
         itemNumber: "",
         productDescription: "",
         rawBlock: "",
+        qtyValue: "",
+        qtyUom: "",
         cartonsQty: "",
         piecesQty: "",
         squareFeetQty: "",
@@ -888,8 +987,11 @@
         row?.palletNumber,
         row?.orderNumber,
         row?.orderType,
+        row?.customerName,
         row?.itemNumber,
         getDescription(row),
+        row?.qtyValue,
+        row?.qtyUom,
         row?.cartonsQty,
         row?.piecesQty,
         row?.squareFeetQty,
@@ -918,10 +1020,13 @@
             orderType: safeUpper(row.orderType),
             rawOrderType: safeText(row.rawOrderType),
             orderTypeConfidence: safeText(row.orderTypeConfidence),
+            customerName: safeText(row.customerName || row.customer_name),
             itemNumber: safeText(row.itemNumber),
             productDescription: safeText(getDescription(row)) || "Needs review",
-            cartonsQty: Number(row.cartonsQty || 0),
-            piecesQty: Number(row.piecesQty || 0),
+            qtyValue: safeText(row.qtyValue || row.quantity),
+            qtyUom: safeText(row.qtyUom || row.uom),
+            cartonsQty: safeText(row.cartonsQty),
+            piecesQty: safeText(row.piecesQty),
             squareFeetQty: Number(row.squareFeetQty || 0),
             otherQty: Number(row.otherQty || 0),
             confidence: row.confidence,
@@ -948,12 +1053,15 @@
               : "",
             rawOrderType: safeText(normalizedRow.rawOrderType),
             orderTypeConfidence: safeText(normalizedRow.orderTypeConfidence),
+            customerName: safeText(normalizedRow.customerName),
             itemNumber: normalizedRow.itemNumber,
             productDescription: safeText(getDescription(normalizedRow)) || "Needs review",
-            cartonsQty: serializeCount(quantityBuckets.cartonsQty),
-            piecesQty: serializeCount(quantityBuckets.piecesQty),
-            squareFeetQty: serializeCount(quantityBuckets.squareFeetQty),
-            otherQty: serializeCount(quantityBuckets.otherQty)
+            qtyValue: safeText(normalizedRow.qtyValue || normalizedRow.quantity),
+            qtyUom: safeText(normalizedRow.qtyUom || normalizedRow.uom),
+            cartonsQty: safeText(quantityBuckets.cartonsQty),
+            piecesQty: safeText(quantityBuckets.piecesQty),
+            squareFeetQty: safeText(quantityBuckets.squareFeetQty),
+            otherQty: safeText(quantityBuckets.otherQty)
           },
           rowIndex
         )
@@ -1424,7 +1532,81 @@
     return quantityBuckets;
   }
 
+  function normalizeQuantityToken(value) {
+    return safeText(value).replace(/,/g, "").replace(/\.\s+(\d{2})\b/g, ".$1");
+  }
+
+  function extractEmserOrderedQuantityDetails(text) {
+    const normalizedText = normalizeUomDetectionText(String(text || "").toUpperCase()).replace(/\s+/g, " ").trim();
+    if (!normalizedText) {
+      return null;
+    }
+
+    const tokenPattern = new RegExp(`(${QUANTITY_VALUE_REGEX_SOURCE}|${UOM_REGEX_SOURCE})`, "g");
+    const rawTokens = Array.from(normalizedText.matchAll(tokenPattern)).map((match) => normalizeQuantityToken(match[0]));
+    const mergedTokens = normalizeEmserTailNumberTokens(rawTokens).filter(Boolean);
+
+    let bestMatch = null;
+    for (let index = 0; index < mergedTokens.length; index += 1) {
+      const currentToken = mergedTokens[index];
+      const normalizedUom = normalizeUom(currentToken);
+      if (!normalizedUom) {
+        continue;
+      }
+
+      const qtyToken = normalizeQuantityToken(mergedTokens[index - 1]);
+      if (!isNumericText(qtyToken)) {
+        continue;
+      }
+
+      const trailingNumericTokens = [];
+      for (let nextIndex = index + 1; nextIndex < mergedTokens.length; nextIndex += 1) {
+        const nextToken = normalizeQuantityToken(mergedTokens[nextIndex]);
+        if (isNumericText(nextToken)) {
+          trailingNumericTokens.push(nextToken);
+          continue;
+        }
+
+        if (normalizeUom(nextToken)) {
+          break;
+        }
+      }
+
+      bestMatch = {
+        qty: qtyToken,
+        uom: normalizedUom,
+        cartons: trailingNumericTokens.length >= 1 ? trailingNumericTokens[0] : "",
+        pieces: trailingNumericTokens.length >= 2 ? trailingNumericTokens[1] : trailingNumericTokens.length === 1 ? trailingNumericTokens[0] : "",
+        quantityTokens: [qtyToken, currentToken, ...trailingNumericTokens.slice(0, 2)].filter(Boolean),
+        source: "emser-ordered"
+      };
+    }
+
+    if (!bestMatch) {
+      return null;
+    }
+
+    if (bestMatch.cartons === bestMatch.pieces && bestMatch.cartons && bestMatch.uom !== "CT" && bestMatch.uom !== "PC") {
+      bestMatch.cartons = "";
+    }
+
+    return buildQuantityDetailsFromFields({
+      qty: bestMatch.qty,
+      uom: bestMatch.uom,
+      cartons: bestMatch.cartons,
+      pieces: bestMatch.pieces,
+      qtySource: "emser-ordered",
+      uomSource: "emser-ordered",
+      quantityTokens: bestMatch.quantityTokens
+    });
+  }
+
   function extractQuantityAndUomDetails(text, orderNumber, orderType, itemNumber) {
+    const orderedEmserDetails = extractEmserOrderedQuantityDetails(text);
+    if (orderedEmserDetails) {
+      return orderedEmserDetails;
+    }
+
     const quantityCandidates = collectQuantityCandidates(text);
     const uniqueCandidates = [];
     const seenCandidateKeys = new Set();
@@ -1458,23 +1640,49 @@
       }
     );
 
-    if (!buildDisplayQty(quantityBuckets) && fallbackQuantity) {
-      assignQuantityCandidateToBuckets(quantityBuckets, fallbackQuantity, detectedUom || "OTHER");
+    const trailingQuantityDetails = extractTrailingQuantityDetails(text);
+    if (!isPopulatedQuantity(quantityBuckets.squareFeetQty) && isPopulatedQuantity(trailingQuantityDetails.squareFeetQty)) {
+      quantityBuckets.squareFeetQty = trailingQuantityDetails.squareFeetQty;
+    }
+    if (!isPopulatedQuantity(quantityBuckets.cartonsQty) && isPopulatedQuantity(trailingQuantityDetails.cartonsQty)) {
+      quantityBuckets.cartonsQty = trailingQuantityDetails.cartonsQty;
+    }
+    if (!isPopulatedQuantity(quantityBuckets.piecesQty) && isPopulatedQuantity(trailingQuantityDetails.piecesQty)) {
+      quantityBuckets.piecesQty = trailingQuantityDetails.piecesQty;
+    }
+    if (!isPopulatedQuantity(quantityBuckets.otherQty) && isPopulatedQuantity(trailingQuantityDetails.otherQty)) {
+      quantityBuckets.otherQty = trailingQuantityDetails.otherQty;
     }
 
-    const displayQty = buildDisplayQty(quantityBuckets);
-    const hasAnyQuantity = Boolean(displayQty);
+    const primaryQuantity = preferredCandidate
+      ? { quantity: preferredCandidate.quantity, uom: preferredCandidate.uom }
+      : trailingQuantityDetails.qtyValue
+        ? { quantity: trailingQuantityDetails.qtyValue, uom: trailingQuantityDetails.qtyUom || detectedUom }
+        : {
+            quantity: fallbackQuantity,
+            uom: detectedUom
+          };
+    const quantityState = {
+      ...quantityBuckets,
+      qtyValue: primaryQuantity.quantity || "",
+      qtyUom: normalizeUom(primaryQuantity.uom)
+    };
+    const displayQty = buildDisplayQty(quantityState);
+    const hasAnyQuantity = Boolean(displayQty || quantityState.qtyValue);
+    const usedTailFallback = !uniqueCandidates.length && trailingQuantityDetails.hasAnyQuantity;
 
     return {
-      quantity: preferredCandidate ? preferredCandidate.quantity : fallbackQuantity,
-      uom: detectedUom,
+      qtyValue: quantityState.qtyValue,
+      qtyUom: quantityState.qtyUom,
+      quantity: quantityState.qtyValue,
+      uom: quantityState.qtyUom || detectedUom || primaryQuantity.uom,
       cartonsQty: quantityBuckets.cartonsQty,
       piecesQty: quantityBuckets.piecesQty,
       squareFeetQty: quantityBuckets.squareFeetQty,
       otherQty: quantityBuckets.otherQty,
       displayQty,
-      quantitySource: uniqueCandidates.length > 0 ? "labeled" : fallbackQuantity ? "fallback" : "missing",
-      uomSource: uniqueCandidates.length > 0 ? "labeled" : detectedUom ? "detected" : "missing",
+      quantitySource: uniqueCandidates.length > 0 ? "labeled" : usedTailFallback ? trailingQuantityDetails.quantitySource : fallbackQuantity ? "fallback" : "missing",
+      uomSource: uniqueCandidates.length > 0 ? "labeled" : detectedUom ? "detected" : usedTailFallback ? trailingQuantityDetails.uomSource : "missing",
       hasAnyQuantity
     };
   }
@@ -2174,6 +2382,25 @@
     return /^[A-Z0-9./_-]+$/.test(cleanedToken) && /\d/.test(cleanedToken);
   }
 
+  function isStrongItemNumberToken(token) {
+    const cleanedToken = sanitizeBlockToken(token);
+    if (!isLikelyItemNumberToken(cleanedToken) || isIgnoredEmserTypeToken(cleanedToken)) {
+      return false;
+    }
+
+    const letters = (cleanedToken.match(/[A-Z]/g) || []).length;
+    const digits = (cleanedToken.match(/\d/g) || []).length;
+    if (letters < 2 || digits < 2 || cleanedToken.length < 8) {
+      return false;
+    }
+
+    if (PRODUCT_HINT_PATTERN.test(cleanedToken) || looksLikeCustomerNameText(cleanedToken)) {
+      return false;
+    }
+
+    return true;
+  }
+
   function tokenizeBlockText(text) {
     return String(text || "")
       .split(/\s+/)
@@ -2227,6 +2454,17 @@
     return uppercaseRatio >= 0.8 && (EMSER_CUSTOMER_NAME_PATTERN.test(normalizedText) || words.length >= 3);
   }
 
+  function extractCustomerNameFromBlock(blockLines) {
+    const customerCandidates = uniqueValues(
+      (blockLines || [])
+        .map((line) => safeText(line?.text))
+        .filter((lineText) => looksLikeCustomerNameText(lineText))
+        .map((lineText) => lineText.replace(/\s+/g, " ").trim())
+    );
+
+    return customerCandidates[0] || "";
+  }
+
   function isShortLineNumberToken(token) {
     return /^\d{1,4}$/.test(sanitizeBlockToken(token));
   }
@@ -2237,44 +2475,135 @@
 
   function buildQuantityDetailsFromFields(fields) {
     const normalizedUom = normalizeUom(fields.uom);
-    const quantityBuckets = {
-      cartonsQty: serializeCount(fields.cartons || 0),
-      piecesQty: serializeCount(fields.pieces || 0),
+    const quantityFields = {
+      qtyValue: fields.qty ? normalizeQuantityToken(fields.qty) : "",
+      qtyUom: normalizedUom,
+      cartonsQty: fields.cartons !== undefined && fields.cartons !== null && safeText(fields.cartons) !== "" ? normalizeQuantityToken(fields.cartons) : "",
+      piecesQty: fields.pieces !== undefined && fields.pieces !== null && safeText(fields.pieces) !== "" ? normalizeQuantityToken(fields.pieces) : "",
       squareFeetQty: "",
       otherQty: ""
     };
 
-    if (normalizedUom === "SF" && fields.qty) {
-      quantityBuckets.squareFeetQty = serializeCount(fields.qty);
-    } else if (!normalizedUom && fields.qty) {
-      quantityBuckets.otherQty = serializeCount(fields.qty);
+    if (!normalizedUom && fields.qty) {
+      quantityFields.otherQty = normalizeQuantityToken(fields.qty);
     }
 
-    if (normalizedUom === "CT" && !isPopulatedQuantity(quantityBuckets.cartonsQty) && fields.qty) {
-      quantityBuckets.cartonsQty = serializeCount(fields.qty);
-    }
-
-    if ((normalizedUom === "PC" || normalizedUom === "EA") && !isPopulatedQuantity(quantityBuckets.piecesQty) && fields.qty) {
-      quantityBuckets.piecesQty = serializeCount(fields.qty);
-    }
-
-    if (normalizedUom && !buildDisplayQty(quantityBuckets) && fields.qty) {
-      assignQuantityCandidateToBuckets(quantityBuckets, fields.qty, normalizedUom);
-    }
-
-    const displayQty = buildDisplayQty(quantityBuckets);
+    const displayQty = buildDisplayQty(quantityFields);
 
     return {
-      quantity: serializeCount(fields.qty || 0),
+      qtyValue: quantityFields.qtyValue,
+      qtyUom: quantityFields.qtyUom,
+      quantity: quantityFields.qtyValue,
       uom: normalizedUom,
-      cartonsQty: quantityBuckets.cartonsQty,
-      piecesQty: quantityBuckets.piecesQty,
-      squareFeetQty: quantityBuckets.squareFeetQty,
-      otherQty: quantityBuckets.otherQty,
+      cartonsQty: quantityFields.cartonsQty,
+      piecesQty: quantityFields.piecesQty,
+      squareFeetQty: quantityFields.squareFeetQty,
+      otherQty: quantityFields.otherQty,
       displayQty,
       quantitySource: fields.qtySource || (fields.qty ? "emser-columns" : "missing"),
       uomSource: normalizedUom ? fields.uomSource || "emser-columns" : "missing",
-      hasAnyQuantity: Boolean(displayQty)
+      quantityTokens: Array.isArray(fields.quantityTokens) ? fields.quantityTokens : [],
+      hasAnyQuantity: Boolean(displayQty || quantityFields.qtyValue)
+    };
+  }
+
+  function pickPrimaryQuantityFromBuckets(quantityBuckets) {
+    if (isPopulatedQuantity(quantityBuckets.squareFeetQty)) {
+      return { quantity: quantityBuckets.squareFeetQty, uom: "SF" };
+    }
+    if (isPopulatedQuantity(quantityBuckets.cartonsQty)) {
+      return { quantity: quantityBuckets.cartonsQty, uom: "CT" };
+    }
+    if (isPopulatedQuantity(quantityBuckets.piecesQty)) {
+      return { quantity: quantityBuckets.piecesQty, uom: "PC" };
+    }
+    if (isPopulatedQuantity(quantityBuckets.otherQty)) {
+      return { quantity: quantityBuckets.otherQty, uom: "OTHER" };
+    }
+    return { quantity: "", uom: "" };
+  }
+
+  function normalizeEmserTailNumberTokens(tokens) {
+    const normalizedTokens = [];
+    const sourceTokens = Array.isArray(tokens) ? tokens : [];
+
+    for (let index = 0; index < sourceTokens.length; index += 1) {
+      const currentToken = safeText(sourceTokens[index]).replace(/,/g, "");
+      const nextToken = safeText(sourceTokens[index + 1]).replace(/,/g, "");
+
+      if (/^\d+(?:\.\d+)?$/.test(currentToken) && /^\d{2}$/.test(nextToken)) {
+        if (!currentToken.includes(".") || /\.$/.test(currentToken)) {
+          normalizedTokens.push(`${currentToken.replace(/\.$/, "")}.${nextToken}`);
+          index += 1;
+          continue;
+        }
+      }
+
+      normalizedTokens.push(currentToken);
+    }
+
+    return normalizedTokens.filter(Boolean);
+  }
+
+  function extractTrailingQuantityDetails(text) {
+    const normalizedText = normalizeUomDetectionText(String(text || "").toUpperCase());
+    const quantityBuckets = {
+      cartonsQty: "",
+      piecesQty: "",
+      squareFeetQty: "",
+      otherQty: ""
+    };
+    const explicitMatches = Array.from(
+      normalizedText.matchAll(new RegExp(`\\b(${QUANTITY_VALUE_REGEX_SOURCE})\\s*(SF|SQFT|CT|CTN|CTNS|CARTON|CARTONS|PC|PCS|PIECE|PIECES|EA)\\b`, "g"))
+    );
+
+    explicitMatches.forEach((match) => {
+      const quantityValue = match[1];
+      const uomValue = normalizeUom(match[2]);
+      if (uomValue === "SF" && !isPopulatedQuantity(quantityBuckets.squareFeetQty)) {
+        quantityBuckets.squareFeetQty = serializeCount(quantityValue);
+      } else if (uomValue === "CT" && !isPopulatedQuantity(quantityBuckets.cartonsQty)) {
+        quantityBuckets.cartonsQty = serializeCount(quantityValue);
+      } else if ((uomValue === "PC" || uomValue === "EA") && !isPopulatedQuantity(quantityBuckets.piecesQty)) {
+        quantityBuckets.piecesQty = serializeCount(quantityValue);
+      }
+    });
+
+    const tailText = normalizedText.slice(Math.max(0, normalizedText.length - 80)).replace(/\.\s+(\d{2})\b/g, ".$1");
+    const rawTailNumbers = (tailText.match(/\b\d+(?:\.\d+)?\b/g) || []).filter((token) => digitsOnly(token).length < 8);
+    const tailNumbers = normalizeEmserTailNumberTokens(rawTailNumbers);
+
+    if (!isPopulatedQuantity(quantityBuckets.squareFeetQty) && tailNumbers.length >= 1) {
+      quantityBuckets.squareFeetQty = serializeCount(tailNumbers[0]);
+    }
+    if (!isPopulatedQuantity(quantityBuckets.cartonsQty) && tailNumbers.length >= 2) {
+      quantityBuckets.cartonsQty = serializeCount(tailNumbers[1]);
+    }
+    if (!isPopulatedQuantity(quantityBuckets.piecesQty) && tailNumbers.length >= 3) {
+      quantityBuckets.piecesQty = serializeCount(tailNumbers[2]);
+    }
+
+    const primaryQuantity = pickPrimaryQuantityFromBuckets(quantityBuckets);
+    return {
+      qtyValue: primaryQuantity.quantity,
+      qtyUom: primaryQuantity.uom === "OTHER" ? "" : primaryQuantity.uom,
+      ...quantityBuckets,
+      quantity: primaryQuantity.quantity,
+      uom: primaryQuantity.uom,
+      displayQty: buildDisplayQty({
+        ...quantityBuckets,
+        qtyValue: primaryQuantity.quantity,
+        qtyUom: primaryQuantity.uom === "OTHER" ? "" : primaryQuantity.uom
+      }),
+      hasAnyQuantity: Boolean(
+        buildDisplayQty({
+          ...quantityBuckets,
+          qtyValue: primaryQuantity.quantity,
+          qtyUom: primaryQuantity.uom === "OTHER" ? "" : primaryQuantity.uom
+        })
+      ),
+      quantitySource: explicitMatches.length > 0 ? "tail-pattern" : tailNumbers.length > 0 ? "tail-fallback" : "missing",
+      uomSource: explicitMatches.length > 0 ? "tail-pattern" : "missing"
     };
   }
 
@@ -2310,11 +2639,8 @@
   }
 
   function extractStructuredEmserDescription(blockLines, itemNumberDetails, context) {
-    if (!itemNumberDetails || !itemNumberDetails.itemNumber) {
-      return null;
-    }
-
     const descriptionParts = [];
+    const safeItemNumber = safeText(itemNumberDetails?.itemNumber);
 
     blockLines.forEach((line, lineIndex) => {
       let lineText = String(line.text || "");
@@ -2322,9 +2648,9 @@
         return;
       }
 
-      if (lineIndex === itemNumberDetails.lineIndex) {
+      if (safeItemNumber && lineIndex === itemNumberDetails.lineIndex) {
         const tokens = tokenizeSourceLine(lineText);
-        const itemTokenIndex = tokens.findIndex((entry) => entry.token === itemNumberDetails.itemNumber);
+        const itemTokenIndex = tokens.findIndex((entry) => entry.token === safeItemNumber);
         if (itemTokenIndex !== -1) {
           const trailingText = tokens
             .slice(itemTokenIndex + 1)
@@ -2333,6 +2659,11 @@
           lineText = trailingText;
         }
       }
+
+      lineText = lineText
+        .replace(/\b\d{8}\b\s+\b(?:SI|S6|S7|C8|SS|SG|S5|S\$|SB|S1|SL|5I)\b(?:\s+\d{8})?/gi, " ")
+        .replace(/\bSK\b\s+\d{1,4}\b/gi, " ")
+        .replace(/^\s*\d{1,4}\s+/, " ");
 
       const trimmedLine = trimEmserDescriptionTail(lineText);
       const cleanedCandidate = cleanupDescriptionCandidate(trimmedLine, context);
@@ -2345,7 +2676,16 @@
       }
     });
 
-    const mergedDescription = uniqueValues(descriptionParts).join(" ").replace(/\s+/g, " ").trim();
+    const sortedCandidates = uniqueValues(descriptionParts)
+      .map((candidate) => ({
+        candidate,
+        score:
+          scoreDescriptionCandidate(candidate) +
+          (/\b\d{1,2}X\d{1,2}(?:X\d{1,2})?\b/i.test(candidate) ? 3 : 0) +
+          Math.min(candidate.length / 12, 4)
+      }))
+      .sort((left, right) => right.score - left.score || right.candidate.length - left.candidate.length);
+    const mergedDescription = sortedCandidates.map((entry) => entry.candidate).join(" ").replace(/\s+/g, " ").trim();
     if (!mergedDescription) {
       return {
         productDescription: "Needs review",
@@ -2355,12 +2695,12 @@
       };
     }
 
-    if (isLikelyItemNumberToken(mergedDescription) || !isHumanReadableDescriptionCandidate(mergedDescription, itemNumberDetails.itemNumber)) {
+    if (isLikelyItemNumberToken(mergedDescription) || !isHumanReadableDescriptionCandidate(mergedDescription, safeItemNumber)) {
       return {
         productDescription: "Needs review",
         source: "guessed",
         score: 0,
-        candidates: uniqueValues(descriptionParts).slice(0, 5)
+        candidates: sortedCandidates.map((entry) => entry.candidate).slice(0, 5)
       };
     }
 
@@ -2368,106 +2708,18 @@
       productDescription: mergedDescription,
       source: "detected",
       score: scoreDescriptionCandidate(mergedDescription),
-      candidates: uniqueValues(descriptionParts).slice(0, 5)
+      candidates: sortedCandidates.map((entry) => entry.candidate).slice(0, 5)
     };
   }
 
   function decodeEmserRowBlock(block) {
     const tokenEntries = tokenizeBlockLines(block.lines).filter((entry) => !looksLikeCustomerNameText(entry.sourceText));
-    const orderEntryIndex = tokenEntries.findIndex((entry) => /^\d{8}$/.test(entry.token));
-    const orderTypeEntryIndex = tokenEntries.findIndex(
-      (entry, index) => index > orderEntryIndex && VALID_ORDER_TYPE_SET.has(normalizeOrderType(entry.token))
-    );
-    const salesOrderEntryIndex = tokenEntries.findIndex(
-      (entry, index) => index > orderTypeEntryIndex && /^\d{8}$/.test(entry.token)
-    );
-    const ignoredTypeEntryIndex = tokenEntries.findIndex(
-      (entry, index) => index > Math.max(orderTypeEntryIndex, salesOrderEntryIndex) && isIgnoredEmserTypeToken(entry.token)
-    );
-    const lineNumberEntryIndex = tokenEntries.findIndex(
-      (entry, index) => index > Math.max(ignoredTypeEntryIndex, salesOrderEntryIndex, orderTypeEntryIndex) && isShortLineNumberToken(entry.token)
-    );
-    const uomEntryIndex = (() => {
-      for (let index = tokenEntries.length - 1; index >= 0; index -= 1) {
-        if (normalizeUom(tokenEntries[index].token)) {
-          return index;
-        }
-      }
-      return -1;
-    })();
-    const qtyEntryIndex = (() => {
-      if (uomEntryIndex === -1) {
-        return -1;
-      }
-      for (let index = uomEntryIndex - 1; index >= 0; index -= 1) {
-        if (isBlockNumericValueToken(tokenEntries[index].token) && !/^\d{8}$/.test(tokenEntries[index].token)) {
-          return index;
-        }
-      }
-      return -1;
-    })();
-    const cartonsEntryIndex = (() => {
-      if (uomEntryIndex === -1) {
-        return -1;
-      }
-      for (let index = uomEntryIndex + 1; index < tokenEntries.length; index += 1) {
-        if (isBlockNumericValueToken(tokenEntries[index].token) && !/^\d{8}$/.test(tokenEntries[index].token)) {
-          return index;
-        }
-      }
-      return -1;
-    })();
-    const piecesEntryIndex = (() => {
-      if (cartonsEntryIndex === -1) {
-        return -1;
-      }
-      for (let index = cartonsEntryIndex + 1; index < tokenEntries.length; index += 1) {
-        if (isBlockNumericValueToken(tokenEntries[index].token) && !/^\d{8}$/.test(tokenEntries[index].token)) {
-          return index;
-        }
-      }
-      return -1;
-    })();
-    const itemEntryIndex = tokenEntries.findIndex((entry, index) => {
-      if (!isLikelyItemNumberToken(entry.token) || isIgnoredEmserTypeToken(entry.token)) {
-        return false;
-      }
-
-      if (index <= Math.max(lineNumberEntryIndex, ignoredTypeEntryIndex, salesOrderEntryIndex, orderTypeEntryIndex)) {
-        return false;
-      }
-
-      if (uomEntryIndex !== -1 && index >= uomEntryIndex) {
-        return false;
-      }
-
-      return true;
-    });
-
-    const itemNumber = itemEntryIndex !== -1 ? tokenEntries[itemEntryIndex].token : "";
-    const qtyValue = qtyEntryIndex !== -1 ? parseCount(tokenEntries[qtyEntryIndex].token) : 0;
-    const cartonsValue = cartonsEntryIndex !== -1 ? parseCount(tokenEntries[cartonsEntryIndex].token) : 0;
-    const piecesValue = piecesEntryIndex !== -1 ? parseCount(tokenEntries[piecesEntryIndex].token) : 0;
-    const uomValue = uomEntryIndex !== -1 ? normalizeUom(tokenEntries[uomEntryIndex].token) : "";
-    const quantityDetails = buildQuantityDetailsFromFields({
-      qty: qtyValue,
-      qtySource: qtyEntryIndex !== -1 ? "emser-columns" : "missing",
-      uom: uomValue,
-      uomSource: uomEntryIndex !== -1 ? "emser-columns" : "missing",
-      cartons: cartonsValue,
-      pieces: piecesValue
-    });
-    const itemNumberDetails = {
-      itemNumber,
-      source: itemNumber ? "emser-column" : "missing",
-      score: itemNumber ? 10 : 0,
-      lineIndex: itemEntryIndex !== -1 ? tokenEntries[itemEntryIndex].lineIndex : -1,
-      tokenIndex: itemEntryIndex
-    };
+    const itemNumberDetails = extractItemNumberFromBlock(block.rawText, block.orderNumber, block.orderType);
+    const quantityDetails = extractQuantityAndUomFromBlock(block.rawText, block.orderNumber, block.orderType, itemNumberDetails.itemNumber);
     const descriptionContext = {
       orderNumber: block.orderNumber,
       orderType: block.orderType,
-      itemNumber,
+      itemNumber: itemNumberDetails.itemNumber,
       quantity: quantityDetails.quantity,
       uom: quantityDetails.uom,
       cartonsQty: quantityDetails.cartonsQty,
@@ -2475,11 +2727,13 @@
       squareFeetQty: quantityDetails.squareFeetQty,
       otherQty: quantityDetails.otherQty
     };
+    const customerName = extractCustomerNameFromBlock(block.lines);
     const descriptionDetails = getSafeDescriptionDetails(
       extractStructuredEmserDescription(block.lines, itemNumberDetails, descriptionContext)
     );
 
     return {
+      customerName,
       itemNumberDetails,
       descriptionDetails,
       countDetails: quantityDetails,
@@ -2487,19 +2741,27 @@
       candidates: {
         orderNumbers: [block.orderNumber].filter(Boolean),
         orderTypes: [block.orderType].filter(Boolean),
-        itemNumbers: itemNumber ? [itemNumber] : [],
+        itemNumbers: itemNumberDetails.itemNumber ? [itemNumberDetails.itemNumber] : [],
         descriptions: descriptionDetails.candidates,
-        quantities: [quantityDetails.displayQty || quantityDetails.quantity].filter(Boolean)
+        quantities: [
+          quantityDetails.displayQty || quantityDetails.qtyValue || quantityDetails.quantity,
+          quantityDetails.qtyValue && quantityDetails.qtyUom ? `${quantityDetails.qtyValue} ${quantityDetails.qtyUom}` : "",
+          quantityDetails.cartonsQty ? `${quantityDetails.cartonsQty} CT` : "",
+          quantityDetails.piecesQty ? `${quantityDetails.piecesQty} PC` : ""
+        ].filter(Boolean)
       },
       errors: [],
       debug: {
         detectedTokens: tokenEntries.map((entry) => entry.token),
         chosenOrderNumber: block.orderNumber,
         chosenOrderType: block.orderType,
-        chosenItemNumber: itemNumber,
+        chosenCustomerName: customerName,
+        chosenItemNumber: itemNumberDetails.itemNumber,
         chosenDescription: getDescription(descriptionDetails),
-        chosenQty: quantityDetails.quantity,
-        chosenUom: quantityDetails.uom,
+        chosenQty: quantityDetails.qtyValue || quantityDetails.quantity,
+        chosenUom: quantityDetails.qtyUom || quantityDetails.uom,
+        chosenQuantityTokens: quantityDetails.quantityTokens || [],
+        chosenSquareFeet: quantityDetails.squareFeetQty,
         chosenCartons: quantityDetails.cartonsQty,
         chosenPieces: quantityDetails.piecesQty
       }
@@ -2508,7 +2770,7 @@
 
   function scoreItemNumberCandidate(token) {
     const cleanedToken = sanitizeBlockToken(token);
-    if (!isLikelyItemNumberToken(cleanedToken)) {
+    if (!isStrongItemNumberToken(cleanedToken)) {
       return -1;
     }
 
@@ -2527,82 +2789,41 @@
   }
 
   function extractItemNumberFromBlock(blockText, orderNumber, orderType) {
-    const directStructuredMatch = String(blockText || "").match(
-      /\b\d{8}\b\s+\b(?:SI|S6|S7|C8)\b(?:\s+\d{8})?\s+\b[A-Z]{2}\b\s+\d{1,4}\s+([A-Z0-9./_-]{5,})\b/i
-    );
+    const tokenLines = buildLinesFromRawText(blockText).map((line, lineIndex) => ({
+      lineIndex,
+      tokens: tokenizeSourceLine(line.text)
+    }));
 
-    if (directStructuredMatch) {
-      const directItemNumber = sanitizeBlockToken(directStructuredMatch[1]);
-      if (isLikelyItemNumberToken(directItemNumber) && !isIgnoredEmserTypeToken(directItemNumber)) {
-        return {
-          itemNumber: directItemNumber,
-          source: "emser-structured",
-          score: 10,
-          lineIndex: 0,
-          tokenIndex: -1
-        };
-      }
-    }
-
-    const labeledMatch = String(blockText || "").match(
-      /\b(?:item|sku|item\s*#|item number|product code)\s*[:#]?\s*([A-Z0-9./_-]{5,})\b/i
-    );
-
-    if (labeledMatch) {
-      const labeledItemNumber = sanitizeBlockToken(labeledMatch[1]);
-      if (isLikelyItemNumberToken(labeledItemNumber)) {
-        return {
-          itemNumber: labeledItemNumber,
-          source: "labeled",
-          score: 8,
-          lineIndex: 0,
-          tokenIndex: -1
-        };
-      }
-    }
-
-    let bestCandidate = null;
-
-    buildLinesFromRawText(blockText).forEach((line, lineIndex) => {
-      const tokens = tokenizeSourceLine(line.text);
+    for (const { lineIndex, tokens } of tokenLines) {
       const orderIndex = tokens.findIndex((entry) => entry.token === sanitizeBlockToken(orderNumber));
       const typeIndex = tokens.findIndex(
-        (entry, tokenIndex) => tokenIndex >= Math.max(orderIndex, 0) && normalizeOrderType(entry.token) === orderType
+        (entry, tokenIndex) => tokenIndex > Math.max(orderIndex, -1) && normalizeOrderType(entry.token) === normalizeOrderType(orderType)
       );
+      const ignoredTypeIndex = tokens.findIndex(
+        (entry, tokenIndex) => tokenIndex > Math.max(typeIndex, orderIndex) && isIgnoredEmserTypeToken(entry.token)
+      );
+      const lineNumberIndex = tokens.findIndex(
+        (entry, tokenIndex) => tokenIndex > Math.max(ignoredTypeIndex, typeIndex, orderIndex) && isShortLineNumberToken(entry.token)
+      );
+      const scanStartIndex = Math.max(lineNumberIndex, ignoredTypeIndex, typeIndex, orderIndex, -1) + 1;
 
-      tokens.forEach((entry, tokenIndex) => {
-        const token = entry.token;
-        const baseScore = scoreItemNumberCandidate(token);
-        if (baseScore < 0 || isIgnoredEmserTypeToken(token)) {
-          return;
+      for (let tokenIndex = scanStartIndex; tokenIndex < tokens.length; tokenIndex += 1) {
+        const token = tokens[tokenIndex].token;
+        if (!isStrongItemNumberToken(token)) {
+          continue;
         }
 
-        const previousToken = tokenIndex > 0 ? tokens[tokenIndex - 1].token : "";
-        const secondPreviousToken = tokenIndex > 1 ? tokens[tokenIndex - 2].token : "";
-        const isAfterOrderType = typeIndex !== -1 && tokenIndex > typeIndex;
-        const precededByLineNumber = /^\d{1,4}$/.test(previousToken);
-        const precededByIgnoredType = isIgnoredEmserTypeToken(previousToken) || isIgnoredEmserTypeToken(secondPreviousToken);
-        const distancePenalty = typeIndex === -1 || !isAfterOrderType ? 0 : Math.max(0, tokenIndex - typeIndex - 6);
-        const score =
-          baseScore +
-          (isAfterOrderType ? 2 : 0) +
-          (precededByLineNumber ? 3 : 0) +
-          (precededByIgnoredType ? 3 : 0) -
-          distancePenalty;
+        return {
+          itemNumber: token,
+          source: "ordered-token",
+          score: scoreItemNumberCandidate(token),
+          lineIndex,
+          tokenIndex
+        };
+      }
+    }
 
-        if (!bestCandidate || score > bestCandidate.score) {
-          bestCandidate = {
-            itemNumber: token,
-            source: precededByIgnoredType || precededByLineNumber ? "emser-token" : isAfterOrderType ? "ordered-token" : "token",
-            score,
-            lineIndex,
-            tokenIndex
-          };
-        }
-      });
-    });
-
-    return bestCandidate || { itemNumber: "", source: "missing", score: 0, lineIndex: -1, tokenIndex: -1 };
+    return { itemNumber: "", source: "missing", score: 0, lineIndex: -1, tokenIndex: -1 };
   }
 
   function cleanupDescriptionCandidate(text, context) {
@@ -2804,7 +3025,6 @@
     const hasAllCoreFields = Boolean(
       safeText(block?.orderNumber) &&
       orderType &&
-      itemNumberDetails.itemNumber &&
       getDescription(safeDescriptionDetails) !== "Needs review" &&
       countDetails.hasAnyQuantity
     );
@@ -2817,10 +3037,6 @@
 
     if (prefixConfidence === "low" && prefixReason) {
       confidenceIssues.push(prefixReason);
-    }
-
-    if (!itemNumberDetails.itemNumber) {
-      confidenceIssues.push("missing item number");
     }
 
     if (getDescription(safeDescriptionDetails) === "Needs review") {
@@ -2852,8 +3068,8 @@
       confidenceReason:
         confidence === "high"
           ? extractionMethod === "OCR" && ocrConfidence !== null
-            ? `Order, type, item, description, and qty were found in the same block. OCR confidence ${ocrConfidence}%.`
-            : "Order, type, item, description, and qty were found in the same block."
+            ? `Order, type, description, and qty were found in the same block. OCR confidence ${ocrConfidence}%.`
+            : "Order, type, description, and qty were found in the same block."
           : confidenceIssues.length > 0
             ? `Low confidence: ${confidenceIssues.join(", ")}.`
             : "Low confidence: review this block."
@@ -2920,6 +3136,7 @@
         orderNumberPrefixCount: block.orderNumberPrefixCount || 0,
         orderNumberPrefixConfidence: block.orderNumberPrefixConfidence || "low",
         orderNumberPrefixReason: block.orderNumberPrefixReason || "",
+        customerName: "",
         itemNumber: "",
         productDescription: "Needs review",
         cartonsQty: "0",
@@ -2957,6 +3174,7 @@
           orderNumberPrefixReason: block.orderNumberPrefixReason || "",
           palletIdentifiers: [defaultPalletLabel].filter(Boolean),
           palletLp: block.palletLp || extractionDetails.pagePalletLp || "",
+          customerName: "",
           itemNumber: "",
           itemNumberSource: "missing",
           itemNumberLineIndex: -1,
@@ -2998,6 +3216,7 @@
             detectedTokens: tokenizeBlockText(block.rawText),
             chosenOrderNumber: block.orderNumber || "",
             chosenOrderType: block.orderType || "",
+            chosenCustomerName: "",
             chosenRawOrderType: block.rawOrderType || "",
             chosenOrderTypeConfidence: block.orderTypeConfidence || "low",
             chosenItemNumber: "",
@@ -3075,11 +3294,16 @@
     };
     let descriptionDetails;
     try {
-      descriptionDetails = getSafeDescriptionDetails(
-        emserDecodedFields
-          ? emserDecodedFields.descriptionDetails
-          : extractDescriptionFromBlock(block.lines, descriptionContext)
-      );
+      const primaryDescriptionDetails = emserDecodedFields
+        ? getSafeDescriptionDetails(emserDecodedFields.descriptionDetails)
+        : getSafeDescriptionDetails(extractDescriptionFromBlock(block.lines, descriptionContext));
+      descriptionDetails =
+        getDescription(primaryDescriptionDetails) !== "Needs review"
+          ? primaryDescriptionDetails
+          : getSafeDescriptionDetails(extractDescriptionFromBlock(block.lines, descriptionContext));
+      if (isLikelyItemNumberToken(getDescription(descriptionDetails)) || looksLikeCustomerNameText(getDescription(descriptionDetails))) {
+        descriptionDetails = getSafeDescriptionDetails(null);
+      }
     } catch (error) {
       console.error("Description decode failed", error, block);
       descriptionDetails = getSafeDescriptionDetails(null);
@@ -3116,8 +3340,11 @@
         orderNumberPrefixCount: block.orderNumberPrefixCount || 0,
         orderNumberPrefixConfidence: block.orderNumberPrefixConfidence || "high",
         orderNumberPrefixReason: block.orderNumberPrefixReason || "",
+        customerName: emserDecodedFields?.customerName || extractCustomerNameFromBlock(block.lines),
         itemNumber: itemNumberDetails.itemNumber,
         productDescription: getDescription(descriptionDetails),
+        qtyValue: countDetails.qtyValue || countDetails.quantity || "0",
+        qtyUom: countDetails.qtyUom || countDetails.uom || "",
         quantity: countDetails.quantity || "0",
         uom: countDetails.uom,
         cartonsQty: countDetails.cartonsQty || "0",
@@ -3158,11 +3385,14 @@
           orderNumberPrefixReason: block.orderNumberPrefixReason || "",
           palletIdentifiers: detectedPalletIdentifiers,
           palletLp: detectedPalletLp,
+          customerName: emserDecodedFields?.customerName || extractCustomerNameFromBlock(block.lines),
           itemNumber: itemNumberDetails.itemNumber,
           itemNumberSource: itemNumberDetails.source,
           itemNumberLineIndex: itemNumberDetails.lineIndex,
           itemNumberTokenIndex: itemNumberDetails.tokenIndex,
           rawBlock: block.rawText,
+          qtyValue: countDetails.qtyValue || countDetails.quantity,
+          qtyUom: countDetails.qtyUom || countDetails.uom,
           quantity: countDetails.quantity,
           quantitySource: countDetails.quantitySource,
           uom: countDetails.uom,
@@ -3183,15 +3413,17 @@
             orderPrefix: block.orderNumberPrefix || "",
             orderPrefixCount: block.orderNumberPrefixCount || 0,
             orderPrefixConfidence: block.orderNumberPrefixConfidence || "high",
+            customerName: emserDecodedFields?.customerName || extractCustomerNameFromBlock(block.lines),
             itemNumber: itemNumberDetails.itemNumber,
             productDescription: getDescription(descriptionDetails),
             productDescriptionSource: descriptionDetails.source || "missing",
             quantities: countDetails.displayQty || "",
-            qty: countDetails.quantity || "",
-            uom: countDetails.uom || "",
+            qty: countDetails.qtyValue || countDetails.quantity || "",
+            uom: countDetails.qtyUom || countDetails.uom || "",
             cartons: countDetails.cartonsQty || "0",
             pieces: countDetails.piecesQty || "0",
-            qtySource: countDetails.quantitySource || "missing"
+            qtySource: countDetails.quantitySource || "missing",
+            quantityTokens: Array.isArray(countDetails.quantityTokens) ? countDetails.quantityTokens.join(" ") : ""
           },
           detectedTokens: emserDecodedFields ? emserDecodedFields.debug.detectedTokens : tokenizeBlockText(block.rawText),
           decoderCandidates: safeCandidates(emserDecodedFields),
@@ -3201,15 +3433,17 @@
                 detectedTokens: tokenizeBlockText(block.rawText),
                 chosenOrderNumber: block.orderNumber,
                 chosenOrderType: block.orderType,
-                chosenRawOrderType: block.rawOrderType || "",
-                chosenOrderTypeConfidence: block.orderTypeConfidence || "high",
-                chosenItemNumber: itemNumberDetails.itemNumber,
-                chosenDescription: getDescription(descriptionDetails),
-                chosenQty: countDetails.quantity,
-                chosenUom: countDetails.uom,
-                chosenCartons: countDetails.cartonsQty,
-                chosenPieces: countDetails.piecesQty
-              }
+                chosenCustomerName: emserDecodedFields?.customerName || extractCustomerNameFromBlock(block.lines),
+            chosenRawOrderType: block.rawOrderType || "",
+            chosenOrderTypeConfidence: block.orderTypeConfidence || "high",
+            chosenItemNumber: itemNumberDetails.itemNumber,
+            chosenDescription: getDescription(descriptionDetails),
+            chosenQty: countDetails.qtyValue || countDetails.quantity,
+            chosenUom: countDetails.qtyUom || countDetails.uom,
+            chosenQuantityTokens: countDetails.quantityTokens || [],
+            chosenCartons: countDetails.cartonsQty,
+            chosenPieces: countDetails.piecesQty
+          }
         }
       }
     };
@@ -4236,6 +4470,7 @@
             palletLp: columnIndexes.pallet_lp === -1 ? "" : safeText(row[columnIndexes.pallet_lp]),
             orderNumber: safeText(row[columnIndexes.order_number]),
             orderType: columnIndexes.order_type === -1 ? "" : safeText(row[columnIndexes.order_type]),
+            customerName: columnIndexes.customer_name === -1 ? "" : safeText(row[columnIndexes.customer_name]),
             itemNumber: columnIndexes.item_number === -1 ? "" : safeText(row[columnIndexes.item_number]),
             productDescription: safeText(row[columnIndexes.product_description]),
             quantity: columnIndexes.quantity === -1 ? "" : row[columnIndexes.quantity],
@@ -4306,20 +4541,36 @@
       });
   }
 
-  function buildSearchResults(rows, mode, query) {
+  function buildSearchResults(rows, mode, query, customerFilter) {
     const trimmedQuery = safeText(query);
+    const normalizedCustomerFilter = normalizeText(customerFilter);
+    const filteredRowsByCustomer = normalizedCustomerFilter
+      ? rows.filter((row) => normalizeText(row.customerName) === normalizedCustomerFilter)
+      : rows;
+
     if (!trimmedQuery) {
+      const groups = groupRowsByPallet(filteredRowsByCustomer);
       return {
-        groups: [],
-        lineCount: 0,
-        palletCount: 0
+        groups,
+        lineCount: filteredRowsByCustomer.length,
+        palletCount: groups.length
       };
     }
 
     const normalizedQuery = normalizeText(trimmedQuery);
     const queryDigits = digitsOnly(trimmedQuery);
 
-    const matchedRows = rows.filter((row) => {
+    const matchedRows = filteredRowsByCustomer.filter((row) => {
+      const matchesAnyCoreField =
+        safeIncludes(row.searchIndex.allText, normalizedQuery) ||
+        safeIncludes(row.searchIndex.customer, normalizedQuery) ||
+        (queryDigits ? safeIncludes(row.searchIndex.orderDigits, queryDigits) : false) ||
+        (queryDigits ? safeIncludes(digitsOnly(row.palletNumber), queryDigits) : false);
+
+      if (matchesAnyCoreField) {
+        return true;
+      }
+
       if (mode === "product") {
         return safeIncludes(row.searchIndex.product, normalizedQuery);
       }
@@ -4442,6 +4693,7 @@
           { className: "result-row-meta" },
           h("span", { className: "badge badge-soft" }, row.orderDisplay || row.orderNumber || "Order"),
           row.orderType ? h("span", { className: "badge" }, row.orderType) : null,
+          row.customerName ? h("span", { className: "detail-pill" }, row.customerName) : null,
           row.itemNumber ? h("span", { className: "detail-pill" }, row.itemNumber) : null
         )
       ),
@@ -4664,6 +4916,13 @@
         "div",
         { className: "result-row-main" },
         showProductName ? h("div", { className: "product-name" }, getDescription(row)) : null,
+        row.customerName
+          ? h(
+              "div",
+              { className: "result-row-meta result-item-meta" },
+              h("span", { className: "muted-text" }, row.customerName)
+            )
+          : null,
         row.itemNumber
           ? h(
               "div",
@@ -5274,10 +5533,10 @@
                           h("th", null, "Type"),
                           h("th", null, "Item"),
                           h("th", null, "Description"),
-                          h("th", null, "CT"),
-                          h("th", null, "PC"),
-                          h("th", null, "SF"),
-                          h("th", null, "Other"),
+                          h("th", null, "Qty"),
+                          h("th", null, "UOM"),
+                          h("th", null, "Cartons"),
+                          h("th", null, "Pieces"),
                           h("th", null, "Confidence"),
                           h("th", null, "")
                         )
@@ -5352,6 +5611,29 @@
                                 null,
                                 h("input", {
                                   className: "table-input table-number-input",
+                                  value: row.qtyValue,
+                                  onChange: (event) => onFieldChange(row.id, "qtyValue", event.target.value)
+                                })
+                              ),
+                              h(
+                                "td",
+                                null,
+                                h(
+                                  "select",
+                                  {
+                                    className: "table-input table-select",
+                                    value: row.qtyUom,
+                                    onChange: (event) => onFieldChange(row.id, "qtyUom", event.target.value)
+                                  },
+                                  h("option", { value: "" }, ""),
+                                  ["SF", "PC", "EA", "CT"].map((uomValue) => h("option", { key: uomValue, value: uomValue }, uomValue))
+                                )
+                              ),
+                              h(
+                                "td",
+                                null,
+                                h("input", {
+                                  className: "table-input table-number-input",
                                   value: row.cartonsQty,
                                   onChange: (event) => onFieldChange(row.id, "cartonsQty", event.target.value)
                                 })
@@ -5363,24 +5645,6 @@
                                   className: "table-input table-number-input",
                                   value: row.piecesQty,
                                   onChange: (event) => onFieldChange(row.id, "piecesQty", event.target.value)
-                                })
-                              ),
-                              h(
-                                "td",
-                                null,
-                                h("input", {
-                                  className: "table-input table-number-input",
-                                  value: row.squareFeetQty,
-                                  onChange: (event) => onFieldChange(row.id, "squareFeetQty", event.target.value)
-                                })
-                              ),
-                              h(
-                                "td",
-                                null,
-                                h("input", {
-                                  className: "table-input table-number-input",
-                                  value: row.otherQty,
-                                  onChange: (event) => onFieldChange(row.id, "otherQty", event.target.value)
                                 })
                               ),
                               h(
@@ -5483,7 +5747,10 @@
                             ? renderReviewMetaItem("Type source", block.detections.fieldAssignments.orderTypeSource, `${block.id}-type-source`)
                             : null,
                           renderReviewMetaItem("Item", block.detections.fieldAssignments.itemNumber || "", `${block.id}-item`),
-                          renderReviewMetaItem("Qty", block.detections.fieldAssignments.quantities || "", `${block.id}-qty`)
+                          renderReviewMetaItem("Qty", block.detections.fieldAssignments.quantities || "", `${block.id}-qty`),
+                          block.detections.fieldAssignments.quantityTokens
+                            ? renderReviewMetaItem("Qty tokens", block.detections.fieldAssignments.quantityTokens, `${block.id}-qty-tokens`)
+                            : null
                         ),
                         h(
                           "div",
@@ -5719,7 +5986,10 @@
                     { className: "review-meta-row review-meta-row-compact" },
                     renderReviewMetaItem("Order", block.detections.fieldAssignments.orderNumber || "", `${block.id}-order`),
                     renderReviewMetaItem("Type", block.detections.fieldAssignments.orderType || "", `${block.id}-type`),
-                    renderReviewMetaItem("Item", block.detections.fieldAssignments.itemNumber || "", `${block.id}-item`)
+                    renderReviewMetaItem("Item", block.detections.fieldAssignments.itemNumber || "", `${block.id}-item`),
+                    block.detections.fieldAssignments.quantityTokens
+                      ? renderReviewMetaItem("Qty tokens", block.detections.fieldAssignments.quantityTokens, `${block.id}-qty-tokens`)
+                      : null
                   ),
                   h(
                     "div",
@@ -5901,12 +6171,13 @@
                               h("th", null, "Pallet"),
                               h("th", null, "Order"),
                               h("th", null, "Type"),
+                              h("th", null, "Customer"),
                               h("th", null, "Item"),
                               h("th", null, "Description"),
-                              h("th", null, "CT"),
-                              h("th", null, "PC"),
-                              h("th", null, "SF"),
-                              h("th", null, "Other"),
+                              h("th", null, "Qty"),
+                              h("th", null, "UOM"),
+                              h("th", null, "Cartons"),
+                              h("th", null, "Pieces"),
                               h("th", null, "Confidence"),
                               h("th", null, "")
                             )
@@ -5937,12 +6208,26 @@
                                       VALID_ORDER_TYPES.map((orderType) => h("option", { key: orderType, value: orderType }, orderType))
                                     )
                                   ),
+                                  h("td", null, h("input", { className: "table-input", value: row.customerName, onChange: (event) => onFieldChange(row.id, "customerName", event.target.value) })),
                                   h("td", null, h("input", { className: "table-input", value: row.itemNumber, onChange: (event) => onFieldChange(row.id, "itemNumber", event.target.value) })),
                                   h("td", null, h("input", { className: "table-input", value: getDescription(row), onChange: (event) => onFieldChange(row.id, "productDescription", event.target.value) })),
+                                  h("td", null, h("input", { className: "table-input table-number-input", value: row.qtyValue, onChange: (event) => onFieldChange(row.id, "qtyValue", event.target.value) })),
+                                  h(
+                                    "td",
+                                    null,
+                                    h(
+                                      "select",
+                                      {
+                                        className: "table-input table-select",
+                                        value: row.qtyUom,
+                                        onChange: (event) => onFieldChange(row.id, "qtyUom", event.target.value)
+                                      },
+                                      h("option", { value: "" }, ""),
+                                      ["SF", "PC", "EA", "CT"].map((uomValue) => h("option", { key: uomValue, value: uomValue }, uomValue))
+                                    )
+                                  ),
                                   h("td", null, h("input", { className: "table-input table-number-input", value: row.cartonsQty, onChange: (event) => onFieldChange(row.id, "cartonsQty", event.target.value) })),
                                   h("td", null, h("input", { className: "table-input table-number-input", value: row.piecesQty, onChange: (event) => onFieldChange(row.id, "piecesQty", event.target.value) })),
-                                  h("td", null, h("input", { className: "table-input table-number-input", value: row.squareFeetQty, onChange: (event) => onFieldChange(row.id, "squareFeetQty", event.target.value) })),
-                                  h("td", null, h("input", { className: "table-input table-number-input", value: row.otherQty, onChange: (event) => onFieldChange(row.id, "otherQty", event.target.value) })),
                                   h(
                                     "td",
                                     { className: "preview-confidence-cell" },
@@ -5974,7 +6259,7 @@
                                       { className: "preview-row-raw-block" },
                                       h(
                                         "td",
-                                        { colSpan: 11 },
+                                        { colSpan: 12 },
                                         h(
                                           "details",
                                           { className: "preview-row-raw-details" },
@@ -6033,6 +6318,7 @@
     const [importStatus, setImportStatus] = useState("idle");
     const [searchMode, setSearchMode] = useState("product");
     const [query, setQuery] = useState("");
+    const [customerFilter, setCustomerFilter] = useState("");
     const [fileName, setFileName] = useState("");
     const [errorMessage, setErrorMessage] = useState("");
     const [uploadNotice, setUploadNotice] = useState("");
@@ -6052,9 +6338,24 @@
     }, [rows]);
 
     const shipmentDate = shipDates[0] || "Not loaded";
-    const results = useMemo(() => buildSearchResults(rows, searchMode, query), [rows, searchMode, query]);
+    const customerOptions = useMemo(
+      () =>
+        Array.from(new Set(rows.map((row) => safeText(row.customerName)).filter(Boolean))).sort((left, right) =>
+          left.localeCompare(right)
+        ),
+      [rows]
+    );
+    const results = useMemo(() => buildSearchResults(rows, searchMode, query, customerFilter), [rows, searchMode, query, customerFilter]);
     const showLandingPage = !hasData && !pendingImport && importStatus === "idle" && !fileName && !errorMessage;
-    const palletGroups = useMemo(() => groupRowsByPallet(rows), [rows]);
+    const filteredRowsForPallets = useMemo(
+      () =>
+        customerFilter
+          ? rows.filter((row) => normalizeText(row.customerName) === normalizeText(customerFilter))
+          : rows,
+      [rows, customerFilter]
+    );
+    const palletGroups = useMemo(() => groupRowsByPallet(filteredRowsForPallets), [filteredRowsForPallets]);
+    const hasActiveSearch = Boolean(safeText(query) || safeText(customerFilter));
 
     const totalPallets = useMemo(() => {
       return new Set(rows.map((row) => `${row.shipDate}__${row.sourcePage ? `page-${row.sourcePage}` : row.palletNumber}`)).size;
@@ -6070,6 +6371,7 @@
         setRows(parsedRows);
         setHasData(true);
         setQuery("");
+        setCustomerFilter("");
         setFileName("sample-data.csv");
         setErrorMessage("");
         setUploadNotice("Tile sample loaded.");
@@ -6088,6 +6390,7 @@
       setHasData(false);
       setImportStatus("idle");
       setQuery("");
+      setCustomerFilter("");
       setFileName("");
       setErrorMessage("");
       setUploadNotice("");
@@ -6155,21 +6458,31 @@
                   [fieldName]:
                     fieldName === "orderNumber"
                       ? digitsOnly(value).slice(0, 8)
-                      : fieldName === "uom"
+                      : fieldName === "uom" || fieldName === "qtyUom"
                         ? normalizeUom(value)
                         : fieldName === "palletNumber"
                           ? nextPalletNumber
                           : value
                 };
+                const nextQuantityFields = readQuantityFields(nextRow);
                 const nextQuantityBuckets = readQuantityBuckets(nextRow);
-                const primaryQuantityPair = getPrimaryQuantityPair(nextQuantityBuckets);
+                const nextPrimaryQuantityPair = getPrimaryQuantityPair({
+                  ...nextQuantityBuckets,
+                  qtyValue: nextQuantityFields.qtyValue,
+                  qtyUom: nextQuantityFields.qtyUom
+                });
 
                 return applyPreviewReviewState({
                   ...nextRow,
+                  ...nextQuantityFields,
                   ...nextQuantityBuckets,
-                  quantity: safeText(primaryQuantityPair.quantity),
-                  uom: primaryQuantityPair.uom === "OTHER" ? "" : primaryQuantityPair.uom,
-                  displayQty: buildDisplayQty(nextQuantityBuckets)
+                  quantity: safeText(nextQuantityFields.qtyValue || nextPrimaryQuantityPair.quantity),
+                  uom: safeText(nextQuantityFields.qtyUom || (nextPrimaryQuantityPair.uom === "OTHER" ? "" : nextPrimaryQuantityPair.uom)),
+                  displayQty: buildDisplayQty({
+                    ...nextQuantityBuckets,
+                    qtyValue: nextQuantityFields.qtyValue,
+                    qtyUom: nextQuantityFields.qtyUom
+                  })
                 });
               })
             };
@@ -6270,6 +6583,7 @@
         setHasData(true);
         setImportStatus("success");
         setQuery("");
+        setCustomerFilter("");
         setFileName(pendingImport.sourceName);
         setErrorMessage("");
         setUploadNotice(
@@ -6318,6 +6632,7 @@
     function selectPallet(groupPalletNumber) {
       setSearchMode("pallet");
       setQuery(safeText(groupPalletNumber));
+      setCustomerFilter("");
       setErrorMessage("");
       setUploadNotice("");
     }
@@ -6395,6 +6710,7 @@
           setHasData(true);
           setImportStatus("success");
           setQuery("");
+          setCustomerFilter("");
           setFileName(file.name);
           setErrorMessage("");
           setUploadNotice("");
@@ -6513,6 +6829,29 @@
                     )
                   )
                 ),
+                customerOptions.length > 0
+                  ? h(
+                      "div",
+                      { className: "customer-filter-row" },
+                      h(
+                        "label",
+                        { className: "field" },
+                        h("span", { className: "field-label" }, "Customer"),
+                        h(
+                          "select",
+                          {
+                            className: "ship-date-select",
+                            value: customerFilter,
+                            onChange: (event) => setCustomerFilter(event.target.value)
+                          },
+                          h("option", { value: "" }, "All customers"),
+                          customerOptions.map((customerName) =>
+                            h("option", { key: customerName, value: customerName }, customerName)
+                          )
+                        )
+                      )
+                    )
+                  : null,
                 h(
                   "div",
                   { className: "search-row" },
@@ -6545,6 +6884,7 @@
                       { className: "status-row" },
                       fileName ? h("span", { className: "summary-pill" }, fileName) : null,
                       importStatus !== "idle" ? h("span", { className: "summary-pill" }, `Import ${importStatus}`) : null,
+                      customerFilter ? h("span", { className: "summary-pill" }, customerFilter) : null,
                       h("span", { className: "summary-pill" }, ocrDebugMode ? "Debug OCR" : "Normal OCR"),
                       ocrCacheCount ? h("span", { className: "summary-pill" }, `${ocrCacheCount} cached`) : null,
                       importProgress && importProgress.totalPages
@@ -6582,7 +6922,7 @@
                     onReparse: reparsePendingImport,
                     onSave: savePendingImport
                   })
-                : rows.length > 0 && !safeText(query)
+                : rows.length > 0 && !hasActiveSearch
                   ? h(
                       "section",
                       { className: "manual-pallet-section" },
@@ -6607,7 +6947,7 @@
                   : null,
               pendingImport
                 ? null
-                : !safeText(query)
+                : !hasActiveSearch
                   ? h(
                       GuidanceState,
                       {

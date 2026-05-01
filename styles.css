@@ -292,6 +292,11 @@ body {
   width: 100%;
 }
 
+.customer-filter-row {
+  display: grid;
+  width: min(100%, 360px);
+}
+
 .mode-button {
   padding: 0.65rem 0.9rem;
   border-radius: var(--radius-medium);
